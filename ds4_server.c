@@ -12633,7 +12633,7 @@ static bool should_remember_thinking_checkpoint(const request *r,
      * toolless-only behavior; its renderer emits <think></think> either way. */
     const bool dsml_chat = r->model_syntax != SERVER_MODEL_SYNTAX_GLM &&
                            r->api != API_RESPONSES && r->api != API_ANTHROPIC;
-    if ((r->has_tools && !qwen_chat && !dsml_chat) || r->prompt_preserves_reasoning)
+    if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat && !dsml_chat)
         return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -12901,7 +12901,7 @@ static char *build_thinking_visible_text(const request *r,
     return buf_take(&visible);
 }
 
-/* Same idea as build_toolless_thinking_visible_text(), for the has_tools
+/* Same idea as build_thinking_visible_text(), for the has_tools
  * case: chat_history_uses_tool_context() makes render_deepseek_chat_prompt_text()
  * always take the "<think>{reasoning}</think>" branch for every historical
  * assistant turn once any tool schema is present, never the bare "</think>"
@@ -12936,7 +12936,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          bool visible_continuation) {
     char *visible = j->req.has_tools
         ? build_tool_context_thinking_visible_text(&j->req, content)
-        : build_toolless_thinking_visible_text(&j->req, content);
+        : build_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
     thinking_live_remember(s, slot, visible, &j->req);
@@ -13195,7 +13195,7 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * replay real reasoning still gets an ordinary token-prefix hit before this
  * fallback is ever consulted, so this is purely additive. GLM is left alone
  * for the same reason as should_remember_thinking_checkpoint(). */
-static void remember_tool_thinking_checkpoint709(server *s, server_slot *slot,
+static void remember_tool_thinking_checkpoint(server *s, server_slot *slot,
                                               const job *j, const char *ctx,
                                               uint64_t trace_id,
                                               const char *content,
@@ -14675,7 +14675,7 @@ decode_again:
                 parsed_content ? parsed_content : "",
                 &parsed_calls))
         {
-            remember_tool_thinking_checkpoint709(s, slot, j, ctx_span, trace_id,
+            remember_tool_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                                  parsed_content ? parsed_content : "",
                                                  &parsed_calls);
         }
@@ -21551,7 +21551,7 @@ static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup("<｜Assistant｜><think>");
 
-    char *toolless = build_toolless_thinking_visible_text(&r, "hi");
+    char *toolless = build_thinking_visible_text(&r, "hi");
     TEST_ASSERT(toolless != NULL);
     TEST_ASSERT(strstr(toolless, "<｜Assistant｜></think>hi") != NULL);
     TEST_ASSERT(strstr(toolless, "<think></think>") == NULL);
@@ -21569,7 +21569,7 @@ static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_NONE;
     r.prompt_text = xstrdup("<｜Assistant｜></think>");
-    TEST_ASSERT(build_toolless_thinking_visible_text(&r, "hi") == NULL);
+    TEST_ASSERT(build_thinking_visible_text(&r, "hi") == NULL);
     TEST_ASSERT(build_tool_context_thinking_visible_text(&r, "hi") == NULL);
     request_free(&r);
 }
