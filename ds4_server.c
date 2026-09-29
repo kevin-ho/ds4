@@ -10144,6 +10144,7 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    const char *model_alias;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -15166,7 +15167,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15183,8 +15184,15 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         "\"top_provider\":{"
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
-            "\"is_moderated\":false},"
-        "\"supported_parameters\":["
+            "\"is_moderated\":false}",
+        ctx,
+        ctx,
+        max_completion);
+    if (vision)
+        buf_puts(b,
+                 ",\"modalities\":[\"text\",\"image\"],\"has_vision\":true");
+    buf_puts(b,
+        ",\"supported_parameters\":["
             "\"tools\","
             "\"tool_choice\","
             "\"max_tokens\","
@@ -15196,18 +15204,15 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
-            "\"reasoning_effort\"]}",
-        ctx,
-        ctx,
-        max_completion);
+            "\"reasoning_effort\"]}");
 }
-
 static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             s->engine && ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -15222,7 +15227,9 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (s->model_alias) {
+        append_model_json(&b, s, s->model_alias);
+    } else if (ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -15379,11 +15386,13 @@ static void *client_main(void *arg) {
     }
     const char *model_path_prefix = "/v1/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
+    const char *model_path_id = hr.path + model_path_prefix_len;
     if (!strcmp(hr.method, "GET") &&
         !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        (server_model_alias_known(model_path_id) ||
+         (s->model_alias && !strcmp(model_path_id, s->model_alias))))
     {
-        send_model(s, fd, hr.path + model_path_prefix_len);
+        send_model(s, fd, model_path_id);
         http_request_free(&hr);
         goto done;
     }
@@ -15513,6 +15522,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    const char *model_alias;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15713,6 +15723,16 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--model-alias")) {
+            const char *alias_val = need_arg(&i, argc, argv, arg);
+            if (!*alias_val ||
+                strcspn(alias_val, " \t\r\n\"\\") != strlen(alias_val)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --model-alias must be a non-empty id "
+                           "without whitespace or quotes");
+                exit(2);
+            }
+            c.model_alias = alias_val;
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
@@ -16019,6 +16039,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
+    s.model_alias = cfg.model_alias;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
@@ -16268,6 +16289,19 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_model_alias_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.model_alias == NULL);
+
+    char *custom_argv[] = {
+        "ds4-server", "--model-alias", "whale-flash"
+    };
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.model_alias != NULL);
+    TEST_ASSERT(!strcmp(custom.model_alias, "whale-flash"));
 }
 
 /* Reuse-aware slot routing: the probe must recognize every way a request
@@ -21184,7 +21218,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -21193,7 +21227,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
@@ -21530,7 +21564,7 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.api = API_ANTHROPIC;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.api = API_CHAT_COMPLETIONS;
+    r.api = API_OPENAI;
     r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
@@ -23090,6 +23124,7 @@ static void ds4_server_unit_tests_run(void) {
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_model_alias_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
